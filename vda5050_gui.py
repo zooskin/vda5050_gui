@@ -1352,6 +1352,16 @@ class MainWindow(QMainWindow):
         self._record_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 4px;")
         toolbar.addWidget(self._record_label)
 
+        # Clear button (live mode)
+        self._btn_clear = QPushButton("Clear")
+        self._btn_clear.setStyleSheet(
+            "QPushButton { background: #F5F5F5; border: 1px solid #CCC; }"
+            "QPushButton:hover { background: #FFEBEE; border: 1px solid #E57373; }"
+        )
+        self._btn_clear.setToolTip("Clear all accumulated log data (live mode)")
+        self._btn_clear.clicked.connect(self._clear_live_data)
+        toolbar.addWidget(self._btn_clear)
+
         toolbar.addSeparator()
 
         # AGV filter button
@@ -1577,6 +1587,30 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Offline mode – use timeline to navigate")
         else:
             self.statusBar().showMessage("Live mode – waiting for MQTT data")
+
+    # -- Clear live data --
+
+    def _clear_live_data(self):
+        """Clear all accumulated log data while keeping MQTT connection alive."""
+        if self._mode != "live":
+            self.statusBar().showMessage("Clear is only available in live mode")
+            return
+
+        self._store.clear()
+        self._visible_agvs.clear()
+        self._selected_agv = ""
+        self._known_agvs.clear()
+        self._live_discovered_agvs.clear()
+        self._agv_filter_menu.clear()
+        self._update_filter_button_text()
+        self._timeline.set_range(0)
+        self._timeline.set_order_markers([])
+        self._timeline.set_timestamp("")
+        self._auto_fit_done = False
+        self._canvas.set_data({}, {}, set())
+        self._info_panel.update_agv_list([])
+        self._info_panel._text.clear()
+        self.statusBar().showMessage("Live data cleared – waiting for new messages")
 
     # -- MQTT operations --
 
