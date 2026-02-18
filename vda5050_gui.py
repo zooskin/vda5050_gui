@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -1048,6 +1049,272 @@ class InfoPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# OrderProgressPanel – node/edge sequence with progress indication
+# ---------------------------------------------------------------------------
+class OrderProgressPanel(QWidget):
+    """Displays the current order's node-edge sequence with progress status."""
+
+    # Status colors
+    _COL_VISITED = "#9E9E9E"       # grey – already passed
+    _COL_CURRENT = "#4CAF50"       # green – AGV is here now
+    _COL_PENDING_BASE = "#2196F3"  # blue – released, not yet reached
+    _COL_HORIZON = "#FF9800"       # orange – horizon (not released)
+    _COL_ARROW = "#BDBDBD"         # light grey arrow between items
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        # Header row with toggle and copy buttons
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(4)
+        header = QLabel("<b>Order Progress</b>")
+        header.setStyleSheet("font-size: 11px; color: #555;")
+        header_layout.addWidget(header)
+        header_layout.addStretch()
+
+        btn_style = (
+            "QPushButton { background: #F5F5F5; border: 1px solid #CCC; "
+            "padding: 2px 8px; font-size: 10px; border-radius: 3px; }"
+            "QPushButton:hover { background: #E0E0E0; }"
+            "QPushButton:checked { background: #2196F3; color: white; border: 1px solid #1976D2; }"
+        )
+
+        self._btn_toggle = QPushButton("Raw JSON")
+        self._btn_toggle.setCheckable(True)
+        self._btn_toggle.setStyleSheet(btn_style)
+        self._btn_toggle.setToolTip("Toggle between progress view and raw order JSON")
+        self._btn_toggle.clicked.connect(self._toggle_view)
+        header_layout.addWidget(self._btn_toggle)
+
+        self._btn_copy = QPushButton("Copy")
+        self._btn_copy.setStyleSheet(btn_style)
+        self._btn_copy.setToolTip("Copy raw order JSON to clipboard")
+        self._btn_copy.clicked.connect(self._copy_order_json)
+        header_layout.addWidget(self._btn_copy)
+
+        layout.addLayout(header_layout)
+
+        self._summary_label = QLabel("")
+        self._summary_label.setStyleSheet("font-size: 10px; color: #888;")
+        layout.addWidget(self._summary_label)
+
+        # Progress view (HTML)
+        self._text = QTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setFont(QFont("Consolas, Courier", 9))
+        self._text.setStyleSheet(
+            "QTextEdit { background: #FFFFFF; border: 1px solid #DDD; }"
+        )
+        layout.addWidget(self._text)
+
+        # Raw JSON view (plain text, hidden by default)
+        self._raw_text = QTextEdit()
+        self._raw_text.setReadOnly(True)
+        self._raw_text.setFont(QFont("Consolas, Courier", 9))
+        self._raw_text.setStyleSheet(
+            "QTextEdit { background: #FFFDE7; border: 1px solid #DDD; }"
+        )
+        self._raw_text.setVisible(False)
+        layout.addWidget(self._raw_text)
+
+        self._raw_json_str = ""
+        self._showing_raw = False
+
+    def _toggle_view(self):
+        self._showing_raw = self._btn_toggle.isChecked()
+        self._text.setVisible(not self._showing_raw)
+        self._raw_text.setVisible(self._showing_raw)
+        self._btn_toggle.setText("Progress" if self._showing_raw else "Raw JSON")
+
+    def _copy_order_json(self):
+        if not self._raw_json_str:
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self._raw_json_str)
+        self._btn_copy.setText("Copied!")
+        QTimer.singleShot(1500, lambda: self._btn_copy.setText("Copy"))
+
+    def set_snapshot(self, snap: Snapshot, agv_color: QColor = None):
+        """Build and display the node-edge progress sequence."""
+        # Update raw JSON
+        if snap.order:
+            self._raw_json_str = json.dumps(snap.order, indent=2, ensure_ascii=False)
+            self._raw_text.setPlainText(self._raw_json_str)
+        else:
+            self._raw_json_str = ""
+            self._raw_text.setPlainText("")
+
+        if not snap.order or (not snap.nodes and not snap.edges):
+            self._summary_label.setText("No active order")
+            self._text.setHtml(
+                "<pre style='color:#999; font-size:9pt;'>No order data available</pre>"
+            )
+            return
+
+        # Build combined sequence sorted by sequenceId
+        items = []  # list of (sequenceId, type, id, released, data_dict)
+        for n in snap.nodes:
+            items.append((
+                n.get("sequenceId", -1),
+                "node",
+                n.get("nodeId", "?"),
+                n.get("released", False),
+                n,
+            ))
+        for e in snap.edges:
+            items.append((
+                e.get("sequenceId", -1),
+                "edge",
+                e.get("edgeId", "?"),
+                e.get("released", False),
+                e,
+            ))
+        items.sort(key=lambda x: x[0])
+
+        # Determine which nodes/edges are still remaining (from state)
+        remaining_node_ids: set = set()
+        for ns in snap.node_states:
+            remaining_node_ids.add(ns.get("nodeId", ""))
+        remaining_edge_ids: set = set()
+        for es in snap.edge_states:
+            remaining_edge_ids.add(es.get("edgeId", ""))
+
+        last_nid = snap.last_node_id or ""
+        last_seq = snap.last_node_seq_id
+
+        # Classify each item
+        visited_count = 0
+        current_item_index = -1
+        scroll_anchor = ""
+        lines = []
+
+        for idx, (seq, item_type, item_id, released, data) in enumerate(items):
+            if item_type == "node":
+                is_current = (item_id == last_nid and last_nid != "")
+                is_remaining = item_id in remaining_node_ids
+                is_visited = (not is_current and not is_remaining
+                              and last_seq >= 0 and seq <= last_seq)
+            else:  # edge
+                is_current = False
+                is_remaining = item_id in remaining_edge_ids
+                is_visited = (not is_remaining and last_seq >= 0 and seq < last_seq)
+
+            # Determine status
+            if is_current:
+                status = "current"
+                color = self._COL_CURRENT
+                icon = "&#9658;"   # ►
+                current_item_index = idx
+                visited_count += 1
+            elif is_visited:
+                status = "visited"
+                color = self._COL_VISITED
+                icon = "&#10003;"  # ✓
+                visited_count += 1
+            elif released:
+                status = "pending"
+                color = self._COL_PENDING_BASE
+                icon = "&#9675;"   # ○
+            else:
+                status = "horizon"
+                color = self._COL_HORIZON
+                icon = "&#9676;"   # ◌ (dashed circle)
+
+            release_tag = "base" if released else "horizon"
+            type_label = "N" if item_type == "node" else "E"
+
+            # Node: show position info, Edge: show start→end
+            detail = ""
+            if item_type == "node":
+                pos = data.get("nodePosition", {})
+                x, y = pos.get("x"), pos.get("y")
+                if x is not None and y is not None:
+                    detail = f"  ({x:.2f}, {y:.2f})"
+                actions = data.get("actions", [])
+                if actions:
+                    action_types = [a.get("actionType", "?") for a in actions]
+                    detail += f"  [{', '.join(action_types)}]"
+            else:
+                start = data.get("startNodeId", "?")
+                end = data.get("endNodeId", "?")
+                detail = f"  {start} → {end}"
+
+            # Anchor for scrolling to current
+            anchor = ""
+            if is_current:
+                anchor = ' id="current_pos"'
+                scroll_anchor = "current_pos"
+
+            # Build the line
+            if is_current:
+                line = (
+                    f'<div{anchor} style="background:#E8F5E9; padding:2px 4px; '
+                    f'margin:1px 0; border-left:3px solid {color}; font-weight:bold;">'
+                    f'<span style="color:{color}">{icon}</span> '
+                    f'<span style="color:{color}">[{type_label}] {item_id}</span>'
+                    f'<span style="color:#666; font-size:8pt;"> seq={seq} {release_tag}{detail}</span>'
+                    f'</div>'
+                )
+            elif is_visited:
+                line = (
+                    f'<div style="padding:2px 4px; margin:1px 0; '
+                    f'border-left:3px solid #E0E0E0; opacity:0.7;">'
+                    f'<span style="color:{color}">{icon}</span> '
+                    f'<span style="color:{color}; text-decoration:line-through;">'
+                    f'[{type_label}] {item_id}</span>'
+                    f'<span style="color:#AAA; font-size:8pt;"> seq={seq}{detail}</span>'
+                    f'</div>'
+                )
+            else:
+                border_color = color if released else "#FFE0B2"
+                line = (
+                    f'<div style="padding:2px 4px; margin:1px 0; '
+                    f'border-left:3px solid {border_color};">'
+                    f'<span style="color:{color}">{icon}</span> '
+                    f'<span style="color:{color}">[{type_label}] {item_id}</span>'
+                    f'<span style="color:#888; font-size:8pt;"> seq={seq} {release_tag}{detail}</span>'
+                    f'</div>'
+                )
+            lines.append(line)
+
+        # Summary
+        total_items = len(items)
+        n_nodes = sum(1 for i in items if i[1] == "node")
+        n_edges = sum(1 for i in items if i[1] == "edge")
+        n_base = sum(1 for i in items if i[3])
+        self._summary_label.setText(
+            f"Order: {snap.order_id} (update={snap.order_update_id})  |  "
+            f"Progress: {visited_count}/{total_items}  |  "
+            f"Nodes={n_nodes}, Edges={n_edges}  |  Base={n_base}, Horizon={total_items - n_base}"
+        )
+
+        # Legend
+        legend = (
+            '<div style="font-size:8pt; color:#888; margin-bottom:4px; padding:2px;">'
+            f'<span style="color:{self._COL_VISITED}">&#10003; Visited</span> &nbsp; '
+            f'<span style="color:{self._COL_CURRENT}">&#9658; Current</span> &nbsp; '
+            f'<span style="color:{self._COL_PENDING_BASE}">&#9675; Pending(base)</span> &nbsp; '
+            f'<span style="color:{self._COL_HORIZON}">&#9676; Horizon</span>'
+            '</div><hr style="border:none; border-top:1px solid #EEE; margin:2px 0;">'
+        )
+
+        html = (
+            '<div style="font-family: Consolas, monospace; font-size: 9pt;">'
+            + legend
+            + "\n".join(lines)
+            + '</div>'
+        )
+        self._text.setHtml(html)
+
+        # Auto-scroll to current position
+        if scroll_anchor:
+            self._text.scrollToAnchor(scroll_anchor)
+
+
+# ---------------------------------------------------------------------------
 # TimelineWidget – slider + playback controls
 # ---------------------------------------------------------------------------
 class TimelineWidget(QWidget):
@@ -1266,9 +1533,18 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal)
         self._canvas = MapCanvas()
+
+        # Right side: InfoPanel + OrderProgressPanel in vertical splitter
+        right_splitter = QSplitter(Qt.Vertical)
         self._info_panel = InfoPanel()
+        self._order_progress = OrderProgressPanel()
+        right_splitter.addWidget(self._info_panel)
+        right_splitter.addWidget(self._order_progress)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 2)
+
         splitter.addWidget(self._canvas)
-        splitter.addWidget(self._info_panel)
+        splitter.addWidget(right_splitter)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter, stretch=1)
@@ -1610,6 +1886,7 @@ class MainWindow(QMainWindow):
         self._canvas.set_data({}, {}, set())
         self._info_panel.update_agv_list([])
         self._info_panel._text.clear()
+        self._order_progress.set_snapshot(Snapshot())
         self.statusBar().showMessage("Live data cleared – waiting for new messages")
 
     # -- MQTT operations --
@@ -1701,16 +1978,20 @@ class MainWindow(QMainWindow):
         self._canvas.set_data(snapshots, trails, self._visible_agvs, self._selected_agv)
         self._timeline.set_timestamp(timestamp)
 
-        # Update InfoPanel
+        # Update InfoPanel + OrderProgressPanel
         agv_ids = sorted(self._visible_agvs & set(snapshots.keys()))
         self._info_panel.update_agv_list(agv_ids, self._selected_agv)
         if self._selected_agv in snapshots:
             agv_color = self._canvas.get_agv_color(self._selected_agv)
-            self._info_panel.set_snapshot(snapshots[self._selected_agv], self._selected_agv, timestamp, agv_color)
+            snap = snapshots[self._selected_agv]
+            self._info_panel.set_snapshot(snap, self._selected_agv, timestamp, agv_color)
+            self._order_progress.set_snapshot(snap, agv_color)
         elif agv_ids:
             self._selected_agv = agv_ids[0]
             agv_color = self._canvas.get_agv_color(self._selected_agv)
-            self._info_panel.set_snapshot(snapshots[self._selected_agv], self._selected_agv, timestamp, agv_color)
+            snap = snapshots[self._selected_agv]
+            self._info_panel.set_snapshot(snap, self._selected_agv, timestamp, agv_color)
+            self._order_progress.set_snapshot(snap, agv_color)
 
         # Auto-fit on first data display
         if not self._auto_fit_done and snapshots:
